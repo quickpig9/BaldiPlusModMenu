@@ -12,7 +12,7 @@ namespace BaldiModMenu
     [BepInPlugin("local.baldi.modmenu", "Baldi Mod Menu", ModMenuPlugin.MenuVersion)]
     public class ModMenuPlugin : BaseUnityPlugin
     {
-        public const string MenuVersion = "1.4.1";
+        public const string MenuVersion = "1.4.2";
 
         private class Target
         {
@@ -77,14 +77,16 @@ namespace BaldiModMenu
 
         // --- kamera 3D ---
         private int camMode = 0; // 0 normalna, 1 zza plecow, 2 z gory
-        private readonly string[] camModeNames = { "Normalna", "3D zza plecow", "Z gory" };
+        private readonly string[] camModeNames = { "Normalna", "3D zza plecow", "Z gory", "Gora/dol" };
         private float camDist = 20f;
-        private float camHeight = 3f;
+        private float camHeight = 0f;
         private bool showBody = true;
         private Camera camTarget;
-        private Camera savedCam;
-        private Vector3 savedPos;
-        private Quaternion savedRot;
+        private float camPitch = 0f;
+        private float pitchSens = 3f;
+        private Camera worldCam;
+        private float nextCamPick = 0f;
+        private bool mouseAxisBroken = false;
         private GameObject bodyMarker;
 
         // --- niebo ---
@@ -221,7 +223,13 @@ namespace BaldiModMenu
 
             ApplyOptions();
 
-            camTarget = camMode != 0 ? GetCamera() : null;
+            if (Time.unscaledTime >= nextCamPick)
+            {
+                nextCamPick = Time.unscaledTime + 0.5f;
+                worldCam = PickWorldCamera();
+            }
+            camTarget = camMode != 0 ? worldCam : null;
+            UpdatePitchInput();
             UpdateBodyMarker();
             UpdateCeilings();
         }
@@ -794,19 +802,14 @@ namespace BaldiModMenu
         // ===================================================================
         private Camera GetCamera()
         {
-            if (Camera.main != null) return Camera.main;
-            Camera best = null;
-            foreach (Camera c in Camera.allCameras)
-            {
-                if (c == null || !c.enabled) continue;
-                if (best == null || c.depth > best.depth) best = c;
-            }
-            return best;
+            if (worldCam != null) return worldCam;
+            return Camera.main;
         }
 
         private void DrawEsp()
         {
             if (!espNpcs && !espItems) return;
+            if (Event.current.type != EventType.Repaint) return;
             Camera cam = GetCamera();
             if (cam == null) return;
 
@@ -827,7 +830,7 @@ namespace BaldiModMenu
                 if (tg.npc && !espNpcs) continue;
                 if (!tg.npc && !espItems) continue;
 
-                Vector3 sp = cam.WorldToScreenPoint(tg.t.position + Vector3.up * 1f);
+                Vector3 sp = ProjectPoint(cam, tg.t.position + Vector3.up * 1f);
                 if (sp.z <= 0f) continue;
                 float x = sp.x;
                 float y = Screen.height - sp.y;
@@ -1064,15 +1067,27 @@ namespace BaldiModMenu
             GUILayout.Space(10);
             GUILayout.Label("Tryb kamery", GUI.skin.box);
             camMode = GUILayout.Toolbar(camMode, camModeNames);
-            if (camMode != 0)
+            if (camMode == 1 || camMode == 2)
             {
                 GUILayout.Label((camMode == 1 ? "Odleglosc za graczem: " : "Wysokosc nad graczem: ") + Mathf.RoundToInt(camDist));
                 camDist = GUILayout.HorizontalSlider(camDist, 5f, 60f);
-                if (camMode == 1)
-                {
-                    GUILayout.Label("Wysokosc kamery: " + Mathf.RoundToInt(camHeight));
-                    camHeight = GUILayout.HorizontalSlider(camHeight, 0f, 20f);
-                }
+            }
+            if (camMode == 1)
+            {
+                GUILayout.Label("Przesuniecie kamery w pionie: " + Mathf.RoundToInt(camHeight));
+                camHeight = GUILayout.HorizontalSlider(camHeight, -10f, 20f);
+            }
+            if (camMode == 1 || camMode == 3)
+            {
+                GUILayout.Label("Patrzenie gora/dol: " + Mathf.RoundToInt(camPitch) + " st.");
+                GUILayout.Label("Mysz w gore/dol, PageUp/PageDown, Home = reset");
+                camPitch = GUILayout.HorizontalSlider(camPitch, -80f, 80f);
+                GUILayout.Label("Czulosc myszy gora/dol: " + pitchSens.ToString("0.0"));
+                pitchSens = GUILayout.HorizontalSlider(pitchSens, 0.5f, 10f);
+                if (GUILayout.Button("Reset patrzenia")) camPitch = 0f;
+            }
+            if (camMode == 1 || camMode == 2)
+            {
                 showBody = GUILayout.Toggle(showBody, " Pokaz znacznik postaci gracza");
             }
 
@@ -1105,53 +1120,162 @@ namespace BaldiModMenu
         // kamera 3D: zmieniamy pozycje tylko na czas renderowania,
         // wiec gra nie widzi zmian i jej sterowanie dziala normalnie
         // ===================================================================
-        private void OnCamPreCull(Camera c)
+        private struct SavedPose
         {
-            if (camMode == 0 || c == null || c != camTarget) return;
+            public Vector3 pos;
+            public Quaternion rot;
+        }
 
-            Transform t = c.transform;
-            savedCam = c;
-            savedPos = t.position;
-            savedRot = t.rotation;
+        private readonly Dictionary<Camera, SavedPose> savedPoses = new Dictionary<Camera, SavedPose>();
 
-            Vector3 flat = t.forward;
+        private static int PopCount(int v)
+        {
+            uint u = (uint)v;
+            int n = 0;
+            while (u != 0u)
+            {
+                n += (int)(u & 1u);
+                u >>= 1;
+            }
+            return n;
+        }
+
+        // wybiera kamere, ktora renderuje swiat 3D (najwiecej warstw, nie nakladkowa)
+        private Camera PickWorldCamera()
+        {
+            Camera best = null;
+            int bestScore = -1;
+            foreach (Camera c in Camera.allCameras)
+            {
+                if (c == null || !c.enabled || c.orthographic || c.targetTexture != null) continue;
+                int score = PopCount(c.cullingMask) * 2;
+                if (c.clearFlags == CameraClearFlags.Skybox || c.clearFlags == CameraClearFlags.SolidColor) score += 100;
+                if (c == Camera.main) score += 1;
+                if (score > bestScore)
+                {
+                    best = c;
+                    bestScore = score;
+                }
+            }
+            return best;
+        }
+
+        // patrzenie gora/dol (gra Baldi nie ma pionowego rozgladania sie)
+        private void UpdatePitchInput()
+        {
+            if (camMode != 1 && camMode != 3) return;
+            if (Input.GetKeyDown(KeyCode.Home)) camPitch = 0f;
+            if (showMenu || Time.timeScale <= 0f) return;
+
+            float dy = 0f;
+            if (!mouseAxisBroken)
+            {
+                try { dy = Input.GetAxisRaw("Mouse Y"); }
+                catch (Exception) { mouseAxisBroken = true; }
+            }
+            camPitch -= dy * pitchSens;
+            if (Input.GetKey(KeyCode.PageUp)) camPitch -= 60f * Time.unscaledDeltaTime;
+            if (Input.GetKey(KeyCode.PageDown)) camPitch += 60f * Time.unscaledDeltaTime;
+            camPitch = Mathf.Clamp(camPitch, -80f, 80f);
+        }
+
+        // oblicza docelowa pozycje kamery dla wybranego trybu
+        private void ComputeRig(Vector3 origPos, Quaternion origRot, out Vector3 pos, out Quaternion rot)
+        {
+            Vector3 flat = origRot * Vector3.forward;
             flat.y = 0f;
-            if (flat.sqrMagnitude < 0.001f) flat = Vector3.forward;
+            if (flat.sqrMagnitude < 0.0001f) flat = Vector3.forward;
             flat.Normalize();
+            Quaternion baseRot = Quaternion.LookRotation(flat, Vector3.up);
+
+            pos = origPos;
+            rot = origRot;
 
             if (camMode == 1)
             {
-                Vector3 want = savedPos - flat * camDist + Vector3.up * camHeight;
-                Vector3 dir = want - savedPos;
+                Quaternion orbit = baseRot * Quaternion.Euler(camPitch, 0f, 0f);
+                Vector3 pivot = origPos + Vector3.up * camHeight;
+                Vector3 look = orbit * Vector3.forward;
+                Vector3 want = pivot - look * camDist;
+                Vector3 dir = want - pivot;
                 float len = dir.magnitude;
                 RaycastHit hit;
-                if (len > 0.01f && Physics.Raycast(savedPos, dir / len, out hit, len, ~0, QueryTriggerInteraction.Ignore))
+                if (len > 0.01f && Physics.Raycast(pivot, dir / len, out hit, len, ~0, QueryTriggerInteraction.Ignore))
                 {
-                    want = savedPos + dir / len * Mathf.Max(0.5f, hit.distance - 0.5f);
+                    want = pivot + dir / len * Mathf.Max(0.5f, hit.distance - 0.5f);
                 }
-                t.position = want;
-                t.rotation = Quaternion.LookRotation(savedPos - want, Vector3.up);
+                pos = want;
+                rot = orbit;
             }
-            else
+            else if (camMode == 2)
             {
-                t.position = savedPos + Vector3.up * camDist * 2f;
-                t.rotation = Quaternion.LookRotation(Vector3.down, flat);
+                pos = origPos + Vector3.up * camDist * 2f;
+                rot = Quaternion.LookRotation(Vector3.down, flat);
             }
+            else if (camMode == 3)
+            {
+                rot = baseRot * Quaternion.Euler(camPitch, 0f, 0f);
+            }
+        }
+
+        private void OnCamPreCull(Camera c)
+        {
+            if (camMode == 0 || c == null) return;
+            Camera p = camTarget;
+            if (p == null) return;
+
+            Transform pt = p.transform;
+            Transform ct = c.transform;
+            if (c != p)
+            {
+                // kamery stojace w tym samym miejscu co glowna (np. od sprite'ow) ruszamy razem z nia
+                if (c.orthographic) return;
+                if (Vector3.Distance(ct.position, pt.position) > 3f) return;
+                if (Quaternion.Angle(ct.rotation, pt.rotation) > 10f) return;
+            }
+
+            Vector3 np;
+            Quaternion nr;
+            ComputeRig(pt.position, pt.rotation, out np, out nr);
+            Quaternion d = nr * Quaternion.Inverse(pt.rotation);
+
+            SavedPose sp;
+            sp.pos = ct.position;
+            sp.rot = ct.rotation;
+            savedPoses[c] = sp;
+
+            ct.SetPositionAndRotation(np + d * (ct.position - pt.position), d * ct.rotation);
         }
 
         private void OnCamPostRender(Camera c)
         {
-            if (savedCam != null && c == savedCam)
+            SavedPose sp;
+            if (c != null && savedPoses.TryGetValue(c, out sp))
             {
-                c.transform.position = savedPos;
-                c.transform.rotation = savedRot;
-                savedCam = null;
+                c.transform.SetPositionAndRotation(sp.pos, sp.rot);
+                savedPoses.Remove(c);
             }
+        }
+
+        // rzutowanie punktu na ekran z uwzglednieniem trybu kamery (dla ESP)
+        private Vector3 ProjectPoint(Camera cam, Vector3 world)
+        {
+            if (camMode == 0 || cam != camTarget) return cam.WorldToScreenPoint(world);
+            Transform t = cam.transform;
+            Vector3 op = t.position;
+            Quaternion orot = t.rotation;
+            Vector3 np;
+            Quaternion nr;
+            ComputeRig(op, orot, out np, out nr);
+            t.SetPositionAndRotation(np, nr);
+            Vector3 r = cam.WorldToScreenPoint(world);
+            t.SetPositionAndRotation(op, orot);
+            return r;
         }
 
         private void UpdateBodyMarker()
         {
-            bool want = camMode != 0 && showBody && camTarget != null;
+            bool want = (camMode == 1 || camMode == 2) && showBody && camTarget != null;
             if (want)
             {
                 if (bodyMarker == null) CreateMarker();
@@ -1198,6 +1322,14 @@ namespace BaldiModMenu
         // ===================================================================
         // niebo
         // ===================================================================
+        private Material origSkybox;
+        private Material skyMat;
+        private bool skyApplied = false;
+        private Cubemap whiteCube;
+
+        private static readonly string[] skyShaderNames =
+            { "Skybox/Procedural", "Skybox/Cubemap", "Skybox/6 Sided", "Skybox/Panoramic" };
+
         private void ApplySky()
         {
             if (customSky)
@@ -1205,6 +1337,20 @@ namespace BaldiModMenu
                 Color col = rainbowSky
                     ? Color.HSVToRGB(Mathf.Repeat(Time.time * 0.1f, 1f), 0.6f, 1f)
                     : new Color(skyR, skyG, skyB);
+
+                if (!skyApplied)
+                {
+                    origSkybox = RenderSettings.skybox;
+                    BuildSkyMaterial();
+                    skyApplied = true;
+                }
+
+                bool haveSky = skyMat != null;
+                if (haveSky)
+                {
+                    TintSkyMaterial(skyMat, col);
+                    if (RenderSettings.skybox != skyMat) RenderSettings.skybox = skyMat;
+                }
 
                 foreach (Camera c in Camera.allCameras)
                 {
@@ -1217,13 +1363,13 @@ namespace BaldiModMenu
                         origSkyFlags[id] = c.clearFlags;
                         origSkyColor[id] = c.backgroundColor;
                     }
-                    c.clearFlags = CameraClearFlags.SolidColor;
+                    c.clearFlags = haveSky ? CameraClearFlags.Skybox : CameraClearFlags.SolidColor;
                     c.backgroundColor = col;
                 }
-                lastCustomSky = true;
             }
-            else if (lastCustomSky)
+            else if (skyApplied)
             {
+                RenderSettings.skybox = origSkybox;
                 foreach (Camera c in Camera.allCameras)
                 {
                     if (c == null) continue;
@@ -1235,8 +1381,79 @@ namespace BaldiModMenu
                         c.backgroundColor = origSkyColor[id];
                     }
                 }
-                lastCustomSky = false;
+                origSkyFlags.Clear();
+                origSkyColor.Clear();
+                if (skyMat != null) Destroy(skyMat);
+                skyMat = null;
+                skyApplied = false;
             }
+        }
+
+        // kopia skyboxa z gry (zeby zmieniac prawdziwy skybox) albo nowy, jesli gra zadnego nie ma
+        private void BuildSkyMaterial()
+        {
+            skyMat = null;
+            try
+            {
+                if (origSkybox != null)
+                {
+                    skyMat = new Material(origSkybox);
+                }
+                else
+                {
+                    foreach (string n in skyShaderNames)
+                    {
+                        Shader sh = Shader.Find(n);
+                        if (sh != null)
+                        {
+                            skyMat = new Material(sh);
+                            break;
+                        }
+                    }
+                }
+                if (skyMat != null) NeutralizeSkyTextures(skyMat);
+            }
+            catch (Exception e)
+            {
+                Logger.LogError("Niebo: " + e.Message);
+                skyMat = null;
+            }
+        }
+
+        // podmienia tekstury skyboxa na biale, zeby kolor zastapil oryginalne niebo
+        private void NeutralizeSkyTextures(Material m)
+        {
+            if (whiteCube == null)
+            {
+                whiteCube = new Cubemap(8, TextureFormat.RGBA32, false);
+                Color[] px = new Color[64];
+                for (int i = 0; i < px.Length; i++) px[i] = Color.white;
+                CubemapFace[] faces =
+                {
+                    CubemapFace.PositiveX, CubemapFace.NegativeX,
+                    CubemapFace.PositiveY, CubemapFace.NegativeY,
+                    CubemapFace.PositiveZ, CubemapFace.NegativeZ
+                };
+                foreach (CubemapFace f in faces) whiteCube.SetPixels(px, f);
+                whiteCube.Apply();
+            }
+
+            if (m.HasProperty("_Tex")) m.SetTexture("_Tex", whiteCube);
+            string[] flatProps = { "_MainTex", "_FrontTex", "_BackTex", "_LeftTex", "_RightTex", "_UpTex", "_DownTex" };
+            foreach (string p in flatProps)
+            {
+                if (m.HasProperty(p)) m.SetTexture(p, Texture2D.whiteTexture);
+            }
+        }
+
+        private static void TintSkyMaterial(Material m, Color col)
+        {
+            if (m.HasProperty("_SkyTint")) m.SetColor("_SkyTint", col);
+            if (m.HasProperty("_GroundColor")) m.SetColor("_GroundColor", new Color(col.r * 0.7f, col.g * 0.7f, col.b * 0.7f, 1f));
+            if (m.HasProperty("_Exposure")) m.SetFloat("_Exposure", 1.3f);
+            // "Tint" w skyboxach Unity jest mnozony x2, wiec polowa koloru daje prawidlowy kolor
+            if (m.HasProperty("_Tint")) m.SetColor("_Tint", new Color(col.r * 0.5f, col.g * 0.5f, col.b * 0.5f, 1f));
+            if (m.HasProperty("_Color")) m.SetColor("_Color", col);
         }
 
         private void UpdateCeilings()
